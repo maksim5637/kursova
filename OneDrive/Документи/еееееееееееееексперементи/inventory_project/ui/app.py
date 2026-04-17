@@ -34,6 +34,12 @@ class InventoryApp(tk.Tk, IInventoryObserver):
         self._grid_rows = 8
         self._grid_cols = 6
 
+        # Drag & drop state
+        self._drag_item:      Optional[Item] = None
+        self._drag_offset_x:  int            = 0
+        self._drag_offset_y:  int            = 0
+        self._drop_highlight: Optional[tuple[int, int]] = None
+
         self._build_ui()
         self._seed_items()
         self._refresh_all()
@@ -134,7 +140,7 @@ class InventoryApp(tk.Tk, IInventoryObserver):
 
     def _build_grid(self, parent: tk.Frame) -> None:
         self._panel_header(parent, "🎒 ІНВЕНТАР  (клік — вибір, ПКМ — меню)").pack(fill="x")
-        tk.Label(parent, text="Подвійний клік → екіпірувати/використати",
+        tk.Label(parent, text="Подвійний клік → екіпірувати/використати  |  Затисни та тягни → перемістити",
                  bg=BG, fg=TEXT_DIM, font=("Segoe UI", 8)).pack()
 
         canvas_frame = tk.Frame(parent, bg=BG)
@@ -150,6 +156,8 @@ class InventoryApp(tk.Tk, IInventoryObserver):
         self._canvas.bind("<Double-Button-1>", self._grid_dbl_click)
         self._canvas.bind("<Button-3>",        self._grid_rclick)
         self._canvas.bind("<Motion>",          self._grid_hover)
+        self._canvas.bind("<B1-Motion>",       self._drag_motion)
+        self._canvas.bind("<ButtonRelease-1>", self._drag_release)
 
     def _build_equipment_panel(self, parent: tk.Frame) -> None:
         frame = self._panel(parent, "🛡 СПОРЯДЖЕННЯ")
@@ -231,6 +239,21 @@ class InventoryApp(tk.Tk, IInventoryObserver):
                 x2 = x1 + CELL_SIZE - 1
                 y2 = y1 + CELL_SIZE - 1
                 hover = (r, col) == self._hover_cell
+
+                # Підсвітка зони куди скидаємо предмет
+                if self._drop_highlight and self._drag_item:
+                    dr, dc = self._drop_highlight
+                    item = self._drag_item
+                    in_drop = (dr <= r < dr + item.grid_height and
+                               dc <= col < dc + item.grid_width)
+                    # Перевіряємо чи вміщується
+                    can = self._can_drop_at(dr, dc, item)
+                    if in_drop:
+                        fill = "#1a4a1a" if can else "#4a1a1a"
+                        c.create_rectangle(x1, y1, x2, y2,
+                                           fill=fill, outline=BORDER, width=1)
+                        continue
+
                 c.create_rectangle(x1, y1, x2, y2,
                                    fill="#222240" if hover else "#181828",
                                    outline=BORDER, width=1)
@@ -240,27 +263,28 @@ class InventoryApp(tk.Tk, IInventoryObserver):
             if id(item) in drawn or item.grid_x < 0:
                 continue
             drawn.add(id(item))
+            self._draw_item_on_canvas(c, item)
 
-            x1 = item.grid_x * CELL_SIZE + 3
-            y1 = item.grid_y * CELL_SIZE + 3
-            x2 = x1 + item.grid_width  * CELL_SIZE - 5
-            y2 = y1 + item.grid_height * CELL_SIZE - 5
-
-            fill, border_color = ITEM_COLORS.get(item.item_type, ("#333", "#888"))
-            selected = item is self._selected_item
-
-            c.create_rectangle(x1+3, y1+3, x2+3, y2+3, fill="#000000", outline="")
-            c.create_rectangle(x1, y1, x2, y2, fill=fill,
-                                outline=ACCENT2 if selected else border_color,
-                                width=2 if selected else 1)
-
-            short = item.name if len(item.name) <= 11 else item.name[:10] + "…"
-            c.create_text(x1+5, y1+5, text=short,
-                          fill=TEXT, font=("Segoe UI", 8, "bold"), anchor="nw")
-            c.create_text(x1+5, y2-5, text=f"{item.weight}кг",
-                          fill=TEXT_DIM, font=("Segoe UI", 7), anchor="sw")
-            c.create_text(x2-4, y1+4, text=ITEM_ICONS.get(item.item_type, "?"),
-                          fill=border_color, font=("Segoe UI", 9), anchor="ne")
+    def _draw_item_on_canvas(self, c: tk.Canvas, item: Item, alpha: bool = False) -> None:
+        """Малює один предмет на canvas."""
+        if item.grid_x < 0: return
+        x1 = item.grid_x * CELL_SIZE + 3
+        y1 = item.grid_y * CELL_SIZE + 3
+        x2 = x1 + item.grid_width  * CELL_SIZE - 5
+        y2 = y1 + item.grid_height * CELL_SIZE - 5
+        fill, border_color = ITEM_COLORS.get(item.item_type, ("#333", "#888"))
+        selected = item is self._selected_item
+        c.create_rectangle(x1+3, y1+3, x2+3, y2+3, fill="#000000", outline="")
+        c.create_rectangle(x1, y1, x2, y2, fill=fill,
+                           outline=ACCENT2 if selected else border_color,
+                           width=2 if selected else 1)
+        short = item.name if len(item.name) <= 11 else item.name[:10] + "…"
+        c.create_text(x1+5, y1+5, text=short,
+                      fill=TEXT, font=("Segoe UI", 8, "bold"), anchor="nw")
+        c.create_text(x1+5, y2-5, text=f"{item.weight}кг",
+                      fill=TEXT_DIM, font=("Segoe UI", 7), anchor="sw")
+        c.create_text(x2-4, y1+4, text=ITEM_ICONS.get(item.item_type, "?"),
+                      fill=border_color, font=("Segoe UI", 9), anchor="ne")
 
     # ──────────────────────────────────────────────────────────
     #  ОНОВЛЕННЯ UI
@@ -342,7 +366,15 @@ class InventoryApp(tk.Tk, IInventoryObserver):
 
     def _grid_click(self, event: tk.Event) -> None:
         r, c = self._grid_coords(event)
-        self._select_item(self.hero.inventory.get_item_at_grid(r, c))
+        item = self.hero.inventory.get_item_at_grid(r, c)
+        self._select_item(item)
+        # Запам'ятовуємо зміщення всередині предмета для drag
+        if item:
+            self._drag_item    = item
+            self._drag_offset_x = event.x - item.grid_x * CELL_SIZE
+            self._drag_offset_y = event.y - item.grid_y * CELL_SIZE
+        else:
+            self._drag_item = None
 
     def _grid_dbl_click(self, event: tk.Event) -> None:
         r, c = self._grid_coords(event)
@@ -357,10 +389,135 @@ class InventoryApp(tk.Tk, IInventoryObserver):
             self._item_context(event, item)
 
     def _grid_hover(self, event: tk.Event) -> None:
+        if self._drag_item:
+            return  # під час drag hover не потрібен
         cell = (event.y // CELL_SIZE, event.x // CELL_SIZE)
         if cell != self._hover_cell:
             self._hover_cell = cell
             self._draw_grid()
+
+    # ──────────────────────────────────────────────────────────
+    #  DRAG & DROP
+    # ──────────────────────────────────────────────────────────
+    def _drag_motion(self, event: tk.Event) -> None:
+        """Рух миші з затиснутою кнопкою — малюємо ghost предмет."""
+        if not self._drag_item:
+            return
+
+        item = self._drag_item
+
+        # Оновлюємо підсвітку цільової клітинки
+        target_col = (event.x - self._drag_offset_x) // CELL_SIZE
+        target_row = (event.y - self._drag_offset_y) // CELL_SIZE
+        # Притискаємо до меж сітки
+        target_col = max(0, min(target_col, self._grid_cols - item.grid_width))
+        target_row = max(0, min(target_row, self._grid_rows - item.grid_height))
+        self._drop_highlight = (target_row, target_col)
+
+        # Перемальовуємо сітку (підсвітка + всі предмети крім drag)
+        self._draw_grid_drag(item, event.x, event.y)
+
+    def _drag_release(self, event: tk.Event) -> None:
+        """Відпустили кнопку миші — виконуємо переміщення."""
+        if not self._drag_item:
+            return
+
+        item = self._drag_item
+        target_col = (event.x - self._drag_offset_x) // CELL_SIZE
+        target_row = (event.y - self._drag_offset_y) // CELL_SIZE
+        target_col = max(0, min(target_col, self._grid_cols - item.grid_width))
+        target_row = max(0, min(target_row, self._grid_rows - item.grid_height))
+
+        # Якщо позиція не змінилась — нічого не робимо
+        if target_col != item.grid_x or target_row != item.grid_y:
+            if self._can_drop_at(target_row, target_col, item):
+                self._move_item_in_grid(item, target_row, target_col)
+                self._log(f"↕ Переміщено «{item.name}» → ({target_col},{target_row})")
+            else:
+                self._log(f"❌ Неможливо перемістити «{item.name}» — місце зайняте")
+
+        # Скидаємо drag-стан
+        self._drag_item       = None
+        self._drop_highlight  = None
+        self._hover_cell      = (-1, -1)
+        self._draw_grid()
+
+    def _can_drop_at(self, row: int, col: int, item: Item) -> bool:
+        """Перевіряємо чи можна розмістити предмет на нову позицію."""
+        # Вихід за межі сітки
+        if (row < 0 or col < 0 or
+                row + item.grid_height > self._grid_rows or
+                col + item.grid_width  > self._grid_cols):
+            return False
+        # Перевіряємо клітинки (ігноруємо самого себе)
+        for r in range(row, row + item.grid_height):
+            for c in range(col, col + item.grid_width):
+                cell_item = self.hero.inventory.get_item_at_grid(r, c)
+                if cell_item is not None and cell_item is not item:
+                    return False
+        return True
+
+    def _move_item_in_grid(self, item: Item, new_row: int, new_col: int) -> None:
+        """Переміщуємо предмет на нову позицію в сітці."""
+        # Звільняємо старі клітинки
+        self.hero.inventory._grid.remove(item)
+        # Встановлюємо нові координати вручну
+        item.grid_x = new_col
+        item.grid_y = new_row
+        # Заповнюємо нові клітинки
+        for r in range(new_row, new_row + item.grid_height):
+            for c in range(new_col, new_col + item.grid_width):
+                self.hero.inventory._grid._cells[r][c].is_occupied = True
+                self.hero.inventory._grid._cells[r][c].occupied_by = item
+
+    def _draw_grid_drag(self, drag_item: Item, mouse_x: int, mouse_y: int) -> None:
+        """Малюємо сітку під час drag — з ghost-предметом під курсором."""
+        c = self._canvas
+        c.delete("all")
+        rows, cols = self._grid_rows, self._grid_cols
+
+        # Фон клітинок з підсвіткою
+        for r in range(rows):
+            for col in range(cols):
+                x1 = col * CELL_SIZE + 1
+                y1 = r   * CELL_SIZE + 1
+                x2 = x1 + CELL_SIZE - 1
+                y2 = y1 + CELL_SIZE - 1
+
+                fill = "#181828"
+                if self._drop_highlight:
+                    dr, dc = self._drop_highlight
+                    in_zone = (dr <= r < dr + drag_item.grid_height and
+                               dc <= col < dc + drag_item.grid_width)
+                    if in_zone:
+                        can = self._can_drop_at(dr, dc, drag_item)
+                        fill = "#1a4a1a" if can else "#4a1a1a"
+                c.create_rectangle(x1, y1, x2, y2, fill=fill, outline=BORDER, width=1)
+
+        # Малюємо всі предмети крім того що тягнемо
+        drawn: set[int] = set()
+        for item in self.hero.inventory.items:
+            if item is drag_item: continue
+            if id(item) in drawn or item.grid_x < 0: continue
+            drawn.add(id(item))
+            self._draw_item_on_canvas(c, item, alpha=True)
+
+        # Ghost предмет під курсором (напівпрозорий)
+        gx = mouse_x - self._drag_offset_x
+        gy = mouse_y - self._drag_offset_y
+        x1, y1 = gx + 3, gy + 3
+        x2 = x1 + drag_item.grid_width  * CELL_SIZE - 6
+        y2 = y1 + drag_item.grid_height * CELL_SIZE - 6
+        fill, border_color = ITEM_COLORS.get(drag_item.item_type, ("#333", "#888"))
+        # Тінь ghost
+        c.create_rectangle(x1+4, y1+4, x2+4, y2+4, fill="#000000", outline="", stipple="gray50")
+        # Ghost тіло (світліше)
+        c.create_rectangle(x1, y1, x2, y2,
+                           fill=fill, outline=ACCENT2, width=2,
+                           stipple="gray75")
+        short = drag_item.name if len(drag_item.name) <= 11 else drag_item.name[:10] + "…"
+        c.create_text(x1+5, y1+5, text=short,
+                      fill=TEXT, font=("Segoe UI", 8, "bold"), anchor="nw")
 
     # ──────────────────────────────────────────────────────────
     #  ДІЇ З ПРЕДМЕТАМИ
